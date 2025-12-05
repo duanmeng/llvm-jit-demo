@@ -79,8 +79,8 @@ NanoJit::NanoJit(
       *this->lazyCallThroughManager_,
       std::move(indirectStubsManagerBuilder));
 
-  mainJitDylib_.addGenerator(cantFail(
-      DynamicLibrarySearchGenerator::GetForCurrentProcess(
+  mainJitDylib_.addGenerator(
+      cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
           this->dataLayout_.getGlobalPrefix())));
 }
 

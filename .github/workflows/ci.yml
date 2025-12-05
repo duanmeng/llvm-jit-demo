@@ -1,0 +1,55 @@
+name: NanoJit CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-24.04  # 使用较新的 Ubuntu
+
+    env:
+      # 告诉 CMake 去哪里找 LLVM 19
+      LLVM_DIR: /usr/lib/llvm-19/lib/cmake/llvm
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # 1. 安装构建工具和 LLVM 19
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build build-essential wget lsb-release software-properties-common gnupg
+        
+        # 使用 LLVM 官方脚本安装 LLVM 19
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 19 all
+
+    # 2. 设置 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    # 3. 【关键步骤】安装与本地 Mac 一致的 clang-format 版本
+    - name: Install Python Dependencies
+      run: |
+        pip install clang-format==19.1.0
+
+    # 4. 检查代码格式 (调用 scripts/check_format.py)
+    - name: Check Code Format
+      run: make check
+
+    # 5. 编译 Release 版本
+    - name: Build Release
+      run: make release
+
+    # 6. 运行 Demo 验证 (可选)
+    - name: Run Tests
+      run: |
+        ./_build/release/jit_sort
+        ./_build/release/jit_sum
+

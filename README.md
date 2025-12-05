@@ -19,17 +19,42 @@ functions might never be called on specific data paths.
 
 ```mermaid
 graph TD
-    User[User Code] -->|addModule| COD
-    subgraph NanoJit Engine
-        ES[ExecutionSession]
-        subgraph Layer Stack
-            COD[CompileOnDemandLayer] -->|Partitioning| Compile
-            Compile[IRCompileLayer] -->|SimpleCompiler| Object
-            Object[RTDyldObjectLinkingLayer] -->|Link/Load| Mem[SectionMemoryManager]
-        end
-    end
-    Mem -->|Executable Address| User
+    %% 1. 定义外部节点
+    User[User Code]
 
+    %% 2. 定义主引擎容器
+    subgraph Engine [NanoJit Engine]
+        direction TB
+        
+        %% 3. 定义 Session (上下文容器)
+        ES[ExecutionSession]
+
+        %% 4. 定义层级栈
+        subgraph Stack [Layer Stack]
+            direction TB
+            COD[CompileOnDemandLayer]
+            IR[IRCompileLayer]
+            RT[RTDyldObjectLinkingLayer]
+            Mem[SectionMemoryManager]
+
+            %% 层级内部数据流 (实线)
+            COD -- Partitioning --> IR
+            IR -- SimpleCompiler --> RT
+            RT -- Link/Load --> Mem
+        end
+
+        %% [关键修复] 添加虚线连接
+        %% 这条线表示 ES "管理" 或提供 "上下文" 给 Layer
+        %% 它的主要作用是把 ES 锚定在 Stack 旁边，不再孤立
+        ES -. Context / State .-> COD
+    end
+
+    %% 5. 外部数据流
+    User -- addModule --> COD
+    Mem -- Executable Address --> User
+    
+    %% 6. 样式美化 (可选，让 ES 看起来不同)
+    style ES fill:#f9f,stroke:#333,stroke-dasharray: 5 5
 ```
 
 #### 1.2 Layer Hierarchy & Pipeline Implementation
@@ -242,3 +267,188 @@ void executeJitTask() {
 }
 
 ```
+
+#### Deep Dive the Internals
+
+This section provides a microscopic analysis of the implementation. We will dissect
+the memory management in `NanoJit`, the ABI handling in `jit_sum`, and the manual
+control flow construction in `jit_sort`.
+
+##### 6.1 src/nano_jit.cpp: The Engine Core
+The `NanoJit` class acts as the operating system for our generated code.
+It manages memory, permissions, and symbol tables.
+A. The Factory (`NanoJit::create`) - Setting the Stage
+Before we can compile anything, we must describe the "World" to LLVM.
+```C++
+// [nano_jit.cpp]
+Expected<std::unique_ptr<NanoJit>> NanoJit::create() {
+    // 1. ExecutorProcessControl (EPC): "Who am I?"
+    // We use SelfExecutorProcessControl because we are JITing into our OWN process.
+    // If we were JITing for a remote worker, we would use a different EPC.
+    auto EPC = SelfExecutorProcessControl::Create();
+    
+    // 2. JITTargetMachineBuilder (JTMB): "What hardware is this?"
+    // detectHost() automatically finds that we are on, say, Apple M1 (AArch64).
+    JITTargetMachineBuilder JTMB(EPC->get()->getTargetTriple());
+    
+    // 3. DataLayout (DL): "How big is a pointer?"
+    // The DL defines endianness (little-endian) and pointer size (64-bit).
+    // This is CRITICAL for calculating struct offsets later.
+    auto DL = JTMB.getDefaultDataLayoutForTarget();
+    
+    // 4. Return the instance
+    return std::make_unique<NanoJit>(...);
+}
+
+```
+
+B. The Constructor - Wiring the Pipeline
+The layer stack is built from Bottom (Execution) to Top (Source).
+
+```C++
+// [nano_jit.cpp]
+NanoJit::NanoJit(...) {
+    // 1. Object Layer: The "Loader"
+    // When compilation finishes, we have a blob of bytes (Object File).
+    // This layer asks the OS for memory pages (mmap) that are Writable and Executable.
+    // We pass a lambda that creates a NEW SectionMemoryManager for every module.
+    objectLayer_ = std::make_unique<RTDyldObjectLinkingLayer>(
+        *executionSession_,
+        []() { return std::make_unique<SectionMemoryManager>(); });
+
+    // 2. Compile Layer: The "Translator"
+    // This layer takes LLVM IR and runs the 'SimpleCompiler'.
+    // SimpleCompiler invokes the LLVM backend (Instruction Selection, Register Allocation).
+    // It transforms IR -> Machine Code.
+    compileLayer_ = std::make_unique<IRCompileLayer>(
+        *executionSession_, *objectLayer_, 
+        std::make_unique<SimpleCompiler>(*targetMachine_));
+
+    // 3. COD Layer: The "Lazy Manager"
+    // This is the public interface. When you add a module, this layer:
+    // a. Scans for functions.
+    // b. Creates "Stubs" (tiny jump instructions) in memory.
+    // c. Registers a callback: "When Stub X is hit, call the Compiler."
+    compileOnDemandLayer_ = std::make_unique<CompileOnDemandLayer>(
+        *executionSession_, *compileLayer_, ...);
+}
+
+```
+
+##### 6.2 src/jit_sum.cpp: Data & ABI Deep Dive
+This file teaches us how to manipulate C++ structs from JIT code. The key concept
+here is the Load-Store Architecture. LLVM IR cannot perform arithmetic on memory
+directly; it must load to a register, compute, and store back.
+The Scenario: `sum_struct(ComplexStruct* out, ComplexStruct* in1, ComplexStruct* in2)`
+
+```C++
+// [jit_sum.cpp] createStructSumModule
+
+// 1. Define the Memory Layout
+// We tell LLVM that "ComplexStruct" looks like: { i32 (4 bytes), double (8 bytes) }
+// LLVM automatically handles the padding (4 bytes of gap) to align the double.
+StructType* structTy = StructType::create(*ctx, {Type::getInt32Ty(*ctx), Type::getDoubleTy(*ctx)}, "ComplexStruct");
+
+// 2. Get Pointers to Arguments
+// Function arguments are just values. Here, they are Pointers.
+auto args = func->arg_begin();
+Value* outPtr = args++; // Register %0
+Value* in1Ptr = args++; // Register %1
+Value* in2Ptr = args++; // Register %2
+
+// --- Processing Field 'b' (double) ---
+
+// 3. Calculate Address (GEP)
+// GEP = GetElementPtr. It does pointer arithmetic.
+// Logic: BaseAddress(in1Ptr) + Offset(Index 1 = Field 'b')
+Value* bPtr1 = builder.CreateStructGEP(structTy, in1Ptr, 1, "ptr_b1");
+
+// 4. Load from Memory to Register
+// We cannot add 'bPtr1'. That's an address. We need the value AT that address.
+Value* bVal1 = builder.CreateLoad(Type::getDoubleTy(*ctx), bPtr1, "val_b1");
+
+// 5. Repeat for Input 2
+Value* bPtr2 = builder.CreateStructGEP(structTy, in2Ptr, 1, "ptr_b2");
+Value* bVal2 = builder.CreateLoad(Type::getDoubleTy(*ctx), bPtr2, "val_b2");
+
+// 6. Perform Arithmetic (Register to Register)
+// fadd = Floating point Add.
+Value* sumB = builder.CreateFAdd(bVal1, bVal2, "sum_b");
+
+// 7. Store Result to Memory
+// Calculate address of 'out->b'
+Value* outBPtr = builder.CreateStructGEP(structTy, outPtr, 1, "ptr_out_b");
+// Write the value in register 'sumB' to memory address 'outBPtr'
+builder.CreateStore(sumB, outBPtr);
+
+```
+
+##### 6.3 src/jit_sort.cpp: Control Flow & SSA Deep Dive
+This is the most advanced part. We implement Bubble Sort by manually wiring Basic Blocks (BB).
+The Challenge: In C++, `i++` modifies `i`. In LLVM SSA (Static Single Assignment), variables are immutable. We use PHI Nodes to solve this.
+A. The Outer Loop Structure
+
+```C++
+// [jit_sort.cpp] createBubbleSortModule
+
+// 1. Create Blocks
+BasicBlock* entryBB = BasicBlock::Create(*ctx, "entry", func);
+BasicBlock* loopCondBB = BasicBlock::Create(*ctx, "loop_cond", func);
+BasicBlock* loopBodyBB = BasicBlock::Create(*ctx, "loop_body", func);
+BasicBlock* loopEndBB = BasicBlock::Create(*ctx, "loop_end", func);
+
+// 2. The PHI Node (The "Multiplexer")
+// We are inside 'loopCondBB'. We need to know the value of 'i'.
+// PHI Logic: "If we came from 'entry', i=0. If we came from 'loop_body', i=next_i."
+builder.SetInsertPoint(loopCondBB);
+PHINode* iPhi = builder.CreatePHI(Type::getInt32Ty(*ctx), 2, "i_counter");
+
+// 3. Loop Condition: i < n
+Value* cmp = builder.CreateICmpSLT(iPhi, nVal, "i_less_than_n");
+// If true -> go to body. If false -> go to end.
+builder.CreateCondBr(cmp, loopBodyBB, loopEndBB);
+
+```
+
+B. The Swap Logic (Memory Manipulation)
+Inside the inner loop, if `row[j] > row[j+1]`, we swap.
+```C++
+// [jit_sort.cpp]
+// Assume we are in 'swapBB'. We know the addresses of Row J and Row J+1.
+
+// 1. Load EVERYTHING into registers
+// We load ID and Score for both rows.
+Value* id1 = builder.CreateLoad(intTy, idPtr1);
+Value* score1 = builder.CreateLoad(doubleTy, scorePtr1);
+Value* id2 = builder.CreateLoad(intTy, idPtr2);
+Value* score2 = builder.CreateLoad(doubleTy, scorePtr2);
+
+// 2. Store CRISS-CROSS
+// Store ID1 into Ptr2
+builder.CreateStore(id1, idPtr2);
+// Store ID2 into Ptr1
+builder.CreateStore(id2, idPtr1);
+
+// Repeat for Score...
+
+```
+
+C. Closing the Loop (Back Edge)
+```C++
+// [jit_sort.cpp]
+// We are at the end of the loop body.
+// Calculate next_i = i + 1
+Value* nextI = builder.CreateAdd(iPhi, ConstantInt::get(intTy, 1), "next_i");
+
+// Jump back to the condition check
+builder.CreateBr(loopCondBB);
+
+// CRITICAL: Update the PHI Node
+// Now that 'nextI' exists, we can tell the PHI node about it.
+iPhi->addIncoming(ConstantInt::get(intTy, 0), entryBB); // Init
+iPhi->addIncoming(nextI, loopBodyBB);                   // Increment
+
+```
+
+This explicit wiring of jumps (`Br`) and data flow (`PHI`) is exactly what compilers
+like `clang` or `gcc` do internally when they parse your `for` loops.
