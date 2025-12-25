@@ -3,185 +3,294 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Support/InitLLVM.h" // [Fix] Added missing header
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::orc;
 
 namespace nano_jit {
-namespace sort_codegen {
+namespace bool_codegen {
 
-/// Business data structure for sorting.
-struct Row {
-  int id;
-  double score;
+/// ==========================================
+/// 1. Metadata Definitions
+/// ==========================================
+
+/// Enumeration of supported types for JIT compilation.
+enum class JITType { INT32, INT64, DOUBLE };
+
+/// Describes the physical layout of a column in raw memory.
+struct ColumnInfo {
+  JITType type; ///< The data type of the column.
+  int offset; ///< Byte offset from the start of the row.
+  std::string name; ///< Debug name.
 };
 
-// Helper function to create comparison logic for sorting.
-static Value* createCompare(
-    IRBuilder<>& irBuilder,
-    Value* left,
-    Value* right,
-    StructType* rowType) {
-  auto* idPtrA = irBuilder.CreateStructGEP(rowType, left, 0);
-  auto* idPtrB = irBuilder.CreateStructGEP(rowType, right, 0);
-  auto* idA =
-      irBuilder.CreateLoad(Type::getInt32Ty(irBuilder.getContext()), idPtrA);
-  auto* idB =
-      irBuilder.CreateLoad(Type::getInt32Ty(irBuilder.getContext()), idPtrB);
+/// Defines a sorting rule for a specific column.
+struct SortKey {
+  int columnIndex; ///< Index into the schema.
+  bool isAscending; ///< true for ASC, false for DESC.
+};
 
-  auto* idEq = irBuilder.CreateICmpEQ(idA, idB);
-  auto* idLess = irBuilder.CreateICmpSLT(idA, idB);
+/// ==========================================
+/// 2. JIT Code Generation Logic
+/// ==========================================
+namespace {
 
-  auto* scorePtrA = irBuilder.CreateStructGEP(rowType, left, 1);
-  auto* scorePtrB = irBuilder.CreateStructGEP(rowType, right, 1);
-  auto* scoreA = irBuilder.CreateLoad(
-      Type::getDoubleTy(irBuilder.getContext()), scorePtrA);
-  auto* scoreB = irBuilder.CreateLoad(
-      Type::getDoubleTy(irBuilder.getContext()), scorePtrB);
-  auto* scoreLess = irBuilder.CreateFCmpOLT(scoreA, scoreB);
-
-  return irBuilder.CreateSelect(idEq, scoreLess, idLess);
-}
-
-/// Creates the bubble sort module.
-std::unique_ptr<ThreadSafeModule> createBubbleSortModule() {
+/// Generates a specialized boolean comparison function for std::sort.
+///
+/// This function performs "Meta-programming": it executes C++ logic at runtime
+/// to generate a specific LLVM IR function. The generated function is
+/// "hardcoded" with offsets and types, eliminating runtime schema lookups and
+/// branches.
+///
+/// Generated Signature: bool compare(char* rowA, char* rowB)
+/// Returns true if rowA < rowB (strictly), false otherwise.
+std::unique_ptr<ThreadSafeModule> createBoolCompareModule(
+    const std::vector<ColumnInfo>& schema,
+    const std::vector<SortKey>& keys) {
   auto threadSafeContext =
       std::make_unique<ThreadSafeContext>(std::make_unique<LLVMContext>());
-  auto module =
-      std::make_unique<Module>("SortModule", *threadSafeContext->getContext());
+  auto& context = *threadSafeContext->getContext();
+  auto module = std::make_unique<Module>("BoolComparatorModule", context);
 
   module->setDataLayout(
       cantFail(JITTargetMachineBuilder(Triple(sys::getDefaultTargetTriple()))
                    .getDefaultDataLayoutForTarget()));
 
-  auto& context = *threadSafeContext->getContext();
   IRBuilder<> builder(context);
 
-  auto* rowType = StructType::get(
-      context, {Type::getInt32Ty(context), Type::getDoubleTy(context)});
-  auto* rowPtrType = PointerType::getUnqual(context);
+  /// 1. Generate a unique function name based on the sort keys.
+  /// Example: "cmp_0a_1d" means Column 0 Ascending, Column 1 Descending.
+  std::string funcName = "cmp";
+  for (const auto& k : keys) {
+    funcName +=
+        "_" + std::to_string(k.columnIndex) + (k.isAscending ? "a" : "d");
+  }
 
-  auto* functionType = FunctionType::get(
-      Type::getVoidTy(context), {rowPtrType, Type::getInt32Ty(context)}, false);
-  auto* function = Function::Create(
-      functionType, Function::ExternalLinkage, "my_sort", module.get());
+  /// 2. Define the function signature: i1 compare(i8* a, i8* b)
+  /// We use i8* (char*) to represent opaque pointers to raw row memory.
+  Type* i8PtrType = PointerType::get(context, 0);
+  FunctionType* funcType = FunctionType::get(
+      Type::getInt1Ty(context), // Return type: bool (i1)
+      {i8PtrType, i8PtrType}, // Args: char*, char*
+      false);
+  Function* function = Function::Create(
+      funcType, Function::ExternalLinkage, funcName, module.get());
 
-  auto* dataBase = function->getArg(0);
-  auto* size = function->getArg(1);
+  auto* baseA = function->getArg(0);
+  auto* baseB = function->getArg(1);
 
-  auto* entryBlock = BasicBlock::Create(context, "entry", function);
-  auto* loopOuterCondBlock =
-      BasicBlock::Create(context, "loop_outer_cond", function);
-  auto* loopOuterBodyBlock =
-      BasicBlock::Create(context, "loop_outer_body", function);
-  auto* loopInnerCondBlock =
-      BasicBlock::Create(context, "loop_inner_cond", function);
-  auto* loopInnerBodyBlock =
-      BasicBlock::Create(context, "loop_inner_body", function);
-  auto* loopOuterEndBlock =
-      BasicBlock::Create(context, "loop_outer_end", function);
-  auto* exitBlock = BasicBlock::Create(context, "exit", function);
-
+  BasicBlock* entryBlock = BasicBlock::Create(context, "entry", function);
   builder.SetInsertPoint(entryBlock);
-  auto* sizeGt1 = builder.CreateICmpSGT(size, builder.getInt32(1));
-  builder.CreateCondBr(sizeGt1, loopOuterCondBlock, exitBlock);
 
-  builder.SetInsertPoint(loopOuterCondBlock);
-  auto* i = builder.CreatePHI(Type::getInt32Ty(context), 2, "i");
-  i->addIncoming(builder.getInt32(0), entryBlock);
-  auto* sizeMinus1 = builder.CreateSub(size, builder.getInt32(1));
-  auto* outerCond = builder.CreateICmpSLT(i, sizeMinus1);
-  builder.CreateCondBr(outerCond, loopOuterBodyBlock, exitBlock);
+  /// 3. Loop through keys to generate the comparison cascade.
+  /// NOTE: This loop runs at "Compile Time". It unrolls the logic so the
+  /// generated machine code contains NO loops, only a sequence of comparisons.
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const auto& key = keys[i];
+    const auto& colInfo = schema[key.columnIndex];
+    int offset = colInfo.offset;
 
-  builder.SetInsertPoint(loopOuterBodyBlock);
-  builder.CreateBr(loopInnerCondBlock);
+    // Create basic blocks for control flow.
+    BasicBlock* checkInverseBlock =
+        BasicBlock::Create(context, "check_inv_" + std::to_string(i), function);
+    BasicBlock* nextKeyBlock =
+        BasicBlock::Create(context, "next_" + std::to_string(i), function);
+    BasicBlock* retTrueBlock =
+        BasicBlock::Create(context, "ret_true_" + std::to_string(i), function);
+    BasicBlock* retFalseBlock =
+        BasicBlock::Create(context, "ret_false_" + std::to_string(i), function);
 
-  builder.SetInsertPoint(loopInnerCondBlock);
-  auto* j = builder.CreatePHI(Type::getInt32Ty(context), 2, "j");
-  j->addIncoming(builder.getInt32(0), loopOuterBodyBlock);
-  auto* limitInner = builder.CreateSub(sizeMinus1, i);
-  auto* innerCond = builder.CreateICmpSLT(j, limitInner);
-  builder.CreateCondBr(innerCond, loopInnerBodyBlock, loopOuterEndBlock);
+    /// --- Step A: Load Values ---
+    /// Calculate address = base + offset.
+    auto* fieldPtrA = builder.CreateConstInBoundsGEP1_32(
+        Type::getInt8Ty(context), baseA, offset);
+    auto* fieldPtrB = builder.CreateConstInBoundsGEP1_32(
+        Type::getInt8Ty(context), baseB, offset);
 
-  builder.SetInsertPoint(loopInnerBodyBlock);
-  auto* ptrJ = builder.CreateGEP(rowType, dataBase, j);
-  auto* jPlus1 = builder.CreateAdd(j, builder.getInt32(1));
-  auto* ptrJ1 = builder.CreateGEP(rowType, dataBase, jPlus1);
+    Value* valA = nullptr;
+    Value* valB = nullptr;
 
-  auto* shouldSwap = createCompare(builder, ptrJ1, ptrJ, rowType);
+    /// Generate specific Load instructions based on the column type.
+    /// The "if" checks here happen at compile-time, so the generated code
+    /// only contains the correct Load instruction.
+    if (colInfo.type == JITType::INT32) {
+      valA = builder.CreateLoad(Type::getInt32Ty(context), fieldPtrA);
+      valB = builder.CreateLoad(Type::getInt32Ty(context), fieldPtrB);
+    } else if (colInfo.type == JITType::INT64) {
+      valA = builder.CreateLoad(Type::getInt64Ty(context), fieldPtrA);
+      valB = builder.CreateLoad(Type::getInt64Ty(context), fieldPtrB);
+    } else if (colInfo.type == JITType::DOUBLE) {
+      valA = builder.CreateLoad(Type::getDoubleTy(context), fieldPtrA);
+      valB = builder.CreateLoad(Type::getDoubleTy(context), fieldPtrB);
+    }
 
-  auto* swapBlock = BasicBlock::Create(context, "swap", function);
-  auto* noSwapBlock = BasicBlock::Create(context, "noswap", function);
-  builder.CreateCondBr(shouldSwap, swapBlock, noSwapBlock);
+    /// --- Step B: Check "Strictly Meets Condition" (Returns True) ---
+    /// If this condition is met, we know A comes before B, so return true
+    /// immediately.
+    Value* condTrue = nullptr;
 
-  builder.SetInsertPoint(swapBlock);
-  auto* idPtrJ = builder.CreateStructGEP(rowType, ptrJ, 0);
-  auto* idPtrJ1 = builder.CreateStructGEP(rowType, ptrJ1, 0);
-  auto* valIdJ = builder.CreateLoad(Type::getInt32Ty(context), idPtrJ);
-  auto* valIdJ1 = builder.CreateLoad(Type::getInt32Ty(context), idPtrJ1);
-  builder.CreateStore(valIdJ1, idPtrJ);
-  builder.CreateStore(valIdJ, idPtrJ1);
-  auto* scorePtrJ = builder.CreateStructGEP(rowType, ptrJ, 1);
-  auto* scorePtrJ1 = builder.CreateStructGEP(rowType, ptrJ1, 1);
-  auto* valScoreJ = builder.CreateLoad(Type::getDoubleTy(context), scorePtrJ);
-  auto* valScoreJ1 = builder.CreateLoad(Type::getDoubleTy(context), scorePtrJ1);
-  builder.CreateStore(valScoreJ1, scorePtrJ);
-  builder.CreateStore(valScoreJ, scorePtrJ1);
-  builder.CreateBr(noSwapBlock);
+    if (colInfo.type == JITType::DOUBLE) {
+      /// Floating point: Use Ordered comparison (OLT/OGT).
+      /// "Ordered" means if any operand is NaN, the result is false.
+      if (key.isAscending) {
+        // ASC: Return true if A < B
+        condTrue = builder.CreateFCmpOLT(valA, valB);
+      } else {
+        // DESC: Return true if A > B
+        condTrue = builder.CreateFCmpOGT(valA, valB);
+      }
+    } else {
+      /// Integer: Use Signed comparison (SLT/SGT).
+      if (key.isAscending) {
+        condTrue = builder.CreateICmpSLT(valA, valB);
+      } else {
+        condTrue = builder.CreateICmpSGT(valA, valB);
+      }
+    }
 
-  builder.SetInsertPoint(noSwapBlock);
-  auto* nextJ = builder.CreateAdd(j, builder.getInt32(1));
-  j->addIncoming(nextJ, noSwapBlock);
-  builder.CreateBr(loopInnerCondBlock);
+    // If condTrue is met, jump to return TRUE. Else check inverse condition.
+    builder.CreateCondBr(condTrue, retTrueBlock, checkInverseBlock);
 
-  builder.SetInsertPoint(loopOuterEndBlock);
-  auto* nextI = builder.CreateAdd(i, builder.getInt32(1));
-  i->addIncoming(nextI, loopOuterEndBlock);
-  builder.CreateBr(loopOuterCondBlock);
+    /// --- Step C: Check "Strictly Opposite Condition" (Returns False) ---
+    /// If this condition is met, we know B comes before A (or A > B), so return
+    /// false.
+    builder.SetInsertPoint(checkInverseBlock);
+    Value* condFalse = nullptr;
 
-  builder.SetInsertPoint(exitBlock);
-  builder.CreateRetVoid();
+    if (colInfo.type == JITType::DOUBLE) {
+      if (key.isAscending) {
+        // ASC Inverse: Return false if B < A (equivalent to A > B)
+        condFalse = builder.CreateFCmpOLT(valB, valA);
+      } else {
+        // DESC Inverse: Return false if B > A (equivalent to A < B)
+        condFalse = builder.CreateFCmpOGT(valB, valA);
+      }
+    } else {
+      if (key.isAscending) {
+        condFalse = builder.CreateICmpSLT(valB, valA);
+      } else {
+        condFalse = builder.CreateICmpSGT(valB, valA);
+      }
+    }
+
+    // If condFalse is met, jump to return FALSE. Else continue to next key
+    // (Values are Equal).
+    builder.CreateCondBr(condFalse, retFalseBlock, nextKeyBlock);
+
+    /// --- Step D: Fill Return Blocks ---
+    builder.SetInsertPoint(retTrueBlock);
+    builder.CreateRet(builder.getInt1(true));
+
+    builder.SetInsertPoint(retFalseBlock);
+    builder.CreateRet(builder.getInt1(false));
+
+    /// --- Step E: Prepare for Next Loop ---
+    builder.SetInsertPoint(nextKeyBlock);
+  }
+
+  /// 4. End of Function (All keys equal)
+  /// If execution reaches here, it means all keys are equal (A == B).
+  /// For strict weak ordering (a < b), if a == b, we must return false.
+  builder.CreateRet(builder.getInt1(false));
 
   return std::make_unique<ThreadSafeModule>(
       std::move(module), std::move(*threadSafeContext));
 }
+} // namespace
 
-} // namespace sort_codegen
+} // namespace bool_codegen
 } // namespace nano_jit
 
+/// ==========================================
+/// 3. Test Main
+/// ==========================================
 int main(int argc, char* argv[]) {
-  const InitLLVM initLLVM(argc, argv);
+  using namespace nano_jit;
+  using namespace nano_jit::bool_codegen;
 
-  using namespace nano_jit::sort_codegen;
+  /// Define Schema: [Int32 (0-3)] [Double (4-11)]
+  std::vector<ColumnInfo> schema = {
+      {JITType::INT32, 0, "id"}, {JITType::DOUBLE, 4, "score"}};
+  const int ROW_SIZE = 12;
 
-  std::vector<Row> data = {{2, 5.5}, {1, 9.0}, {2, 3.3}, {1, 8.0}, {3, 1.0}};
+  /// Mock data structure for initialization.
+  struct RawData {
+    int32_t id;
+    double score;
+  };
 
-  outs() << "=== Bubble Sort JIT Demo ===\n";
-  outs() << "Before sort:\n";
-  for (const auto& r : data)
-    outs() << "{" << r.id << ", " << r.score << "} ";
-  outs() << "\n";
+  std::vector<RawData> sourceData = {
+      {1, 10.0},
+      {1, 20.0},
+      {2, 10.0},
+      {1, std::numeric_limits<double>::quiet_NaN()}, // NaN case
+      {1, 5.0}};
+
+  /// Prepare raw memory pool to simulate a RowContainer (e.g., in Velox).
+  std::vector<char> memoryPool;
+  std::vector<char*> rowPtrs;
+
+  for (const auto& d : sourceData) {
+    size_t startIdx = memoryPool.size();
+    memoryPool.resize(startIdx + ROW_SIZE);
+    char* ptr = memoryPool.data() + startIdx;
+    /// Manually serialize data into the buffer.
+    std::memcpy(ptr + 0, &d.id, sizeof(int32_t));
+    std::memcpy(ptr + 4, &d.score, sizeof(double));
+    rowPtrs.push_back(ptr);
+  }
+
+  /// Fix up pointers in case resize caused reallocation.
+  for (size_t i = 0; i < sourceData.size(); ++i)
+    rowPtrs[i] = memoryPool.data() + (i * ROW_SIZE);
 
   try {
-    auto& jit = nano_jit::JitManager::get();
-    jit.addModule(std::move(*createBubbleSortModule()));
+    /// Initialize JIT engine (Singleton).
+    auto& jit = JitManager::get();
 
-    const auto jitSort = jit.lookup<void (*)(Row*, int)>("my_sort");
-    jitSort(data.data(), data.size());
+    /// Define Sorting Rules:
+    /// 1. ID Ascending
+    /// 2. Score Descending
+    /// Note: NaN handling is implicit via Ordered comparisons (NaN < X is
+    /// false).
+    std::vector<SortKey> keys = {
+        {0, true}, // id ASC
+        {1, false} // score DESC
+    };
+
+    /// Compile the specialized comparison function.
+    jit.addModule(std::move(*createBoolCompareModule(schema, keys)));
+
+    /// Lookup the compiled function pointer.
+    /// Function name is deterministically generated: "cmp_0a_1d"
+    auto compareFn = jit.lookup<bool (*)(char*, char*)>("cmp_0a_1d");
+
+    std::cout
+        << "=== Sorting: ID ASC, Score DESC (NaNs treated as unordered/false) ===\n";
+
+    /// Perform standard sort using the JIT-compiled comparator.
+    std::sort(rowPtrs.begin(), rowPtrs.end(), compareFn);
+
+    /// Print results by deserializing raw memory.
+    for (char* ptr : rowPtrs) {
+      int32_t id = *reinterpret_cast<int32_t*>(ptr + 0);
+      double score = *reinterpret_cast<double*>(ptr + 4);
+      std::cout << "ID: " << id << ", Score: " << score << "\n";
+    }
+
   } catch (const std::exception& e) {
     errs() << "Error: " << e.what() << "\n";
     return 1;
   }
-
-  outs() << "After sort:\n";
-  for (const auto& r : data)
-    outs() << "{" << r.id << ", " << r.score << "} ";
-  outs() << "\n";
 
   return 0;
 }

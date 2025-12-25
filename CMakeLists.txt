@@ -60,10 +60,5 @@ if (APPLE)
     target_link_libraries(nano_jit PUBLIC "-L${LLVM_LIBRARY_DIRS}")
 endif ()
 
-# --- Demo App 1: Bubble Sort ---
 add_executable(jit_sort src/jit_sort.cpp)
 target_link_libraries(jit_sort PRIVATE nano_jit)
-
-# --- Demo App 2: Expression Sum ---
-add_executable(jit_sum src/jit_sum.cpp)
-target_link_libraries(jit_sum PRIVATE nano_jit)

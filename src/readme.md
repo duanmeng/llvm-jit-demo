@@ -86,41 +86,49 @@ The code uses `IRBuilder` to generate three distinct functions:
     - Performs mixed-type arithmetic.
     - Stores results back to the result pointer.
 - Significance: Demonstrates ABI compatibility between JIT-compiled code and host C++ structs.
-### 4. Implementation Scenario: jit_sort (Algorithmic Logic)
-This module demonstrates compiling complex control flow (loops, branches) to perform an in-memory Bubble
-Sort on a dataset. This simulates a custom operator or UDF (User Defined Function) in a database engine.
-#### 4.1 Data Structure
-The JIT engine interacts with a C++ struct:
 
-```C++
-struct Row {
-  int id;      // Primary Sort Key
-  double score; // Secondary Sort Key
-};
+### 4. Implementation Scenario: jit_sort (Dynamic Comparator)
+This module demonstrates one of the most powerful applications of JIT in database engines: Runtime
+Specialization. It dynamically generates a highly optimized comparison function for `std::sort` based
+on the query schema, eliminating the overhead of interpretation and branch misprediction found in
+generic comparators.
 
-```
+#### 4.1 The Problem: Generic Comparator Overhead
+In a typical query engine, sorting logic is determined at runtime (e.g., `ORDER BY col1 ASC, col2 DESC`).
+A generic C++ comparator must:
+1. Loop through a vector of sort keys.
+2. Check the data type of each column (Int? Double?) inside the loop.
+3. Check the sort direction (Ascending? Descending?) inside the loop.
+4. Calculate memory offsets dynamically.
+   This results in significant CPU overhead due to branch mispredictions and memory indirections.
 
-#### 4.2 IR Generation Logic (createBubbleSortModule)
-The implementation manually constructs the Control Flow Graph (CFG) for the algorithm:
-1. Basic Blocks:
-- `entry`: Function entry.
-- `loop_outer_cond` / `loop_outer_body`: Controls the `i` loop.
-- `loop_inner_cond` / `loop_inner_body`: Controls the `j` loop.
-- `swap` / `noswap`: Conditional execution based on comparison.
-2. PHI Nodes:
-- Uses `CreatePHI` to manage loop variables (`i` and `j`). This is essential in SSA (Static Single Assignment) form to handle variable updates across loop iterations.
-3. Comparison Logic (`createCompare`):
-- Implements a multi-key comparator.
-- First compares `id`. If equal, compares `score`.
-- Uses `CreateSelect` to implement the conditional logic without branching (branchless optimization for the comparator itself).
-4. Memory Access:
-- Calculates array offsets using `CreateGEP`.
-- Swaps elements by loading all fields into registers and storing them back to swapped addresses.
+#### 4.2 JIT Solution: Specialized Codegen
+The `createBoolCompareModule` function generates a specialized function
+signature: `bool compare(char* rowA, char* rowB)`. The generation process "bakes in" all schema
+information, resulting in a flat, branch-free instruction stream.
+Key Optimization Techniques:
+1. Hardcoded Offsets (Immediate Values)
+- Instead of looking up offsets from a schema array at runtime (`*(base + offsets[i])`), the JIT compiler calculates the exact byte offset during codegen.
+- IR: `CreateConstInBoundsGEP1_32(..., offset)`
+- Result: Generates efficient assembly like `mov eax, [rdi + 4]`.
+2. Type Erasure & Branch Elimination
+- The logic for handling data types (Int32 vs Double) and sort direction (ASC vs DESC) is executed at Compile Time (C++ generation phase).
+- The generated machine code contains NO switches or branches for types or directions. It simply executes the specific comparison instruction required (e.g., `icmp slt` or `fcmp ogt`).
+3. Strict Weak Ordering & NaN Handling
+- Implements robust floating-point comparisons using LLVM's Ordered predicates (`FCmpOLT`, `FCmpOGT`).
+- Behavior: If any operand is `NaN`, the comparison strictly returns `false`. This satisfies the stability requirements of `std::sort` without needing expensive `isnan()` checks.
+4. Cascading Logic (Short-Circuiting)
+- The generated code implements a highly efficient cascade:
+  1. Check 1: Does Row A strictly precede Row B? (e.g., `A < B` for ASC). If yes, return `true`.
+  2. Check 2: Does Row B strictly precede Row A? (e.g., `B < A` for ASC). If yes, return `false`.
+  3. Fallthrough: If neither, the keys are equal; proceed to the next column immediately.
+- This ensures that the CPU returns as early as possible, minimizing memory access for subsequent columns.
+
 #### 4.3 Execution Flow
-1. Host C++ code creates a `std::vector<Row>`.
-2. `NanoJit` compiles the `my_sort` function.
-3. Host calls `lookup` to get the function pointer `void (*)(Row*, int)`.
-4. The JIT-compiled machine code modifies the host memory directly, sorting the vector in place.
+1. Schema Definition: The host defines the layout (e.g., `Int32` at offset 0, `Double` at offset 4) and sort keys (e.g., Key 0 ASC, Key 1 DESC).
+2. Codegen: `NanoJit` compiles a specialized function named (e.g., `cmp_0a_1d`).
+3. Integration: The host retrieves the function pointer via `lookup`.
+4. Execution: The pointer is passed directly to `std::sort`. The standard library sorts the raw memory pointers using the JIT-compiled logic, achieving performance comparable to hand-written assembly.
 
 ### 5. How To Integration
 
