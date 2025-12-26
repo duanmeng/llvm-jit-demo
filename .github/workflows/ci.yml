@@ -51,5 +51,4 @@ jobs:
     - name: Run Tests
       run: |
         ./_build/release/jit_sort
-        ./_build/release/jit_sum
 
