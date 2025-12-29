@@ -37,11 +37,12 @@ jobs:
     # 3. 【关键步骤】安装与本地 Mac 一致的 clang-format 版本
     - name: Install Python Dependencies
       run: |
-        pip install clang-format==19.1.0
+        sudo apt update
+        sudo apt install -y clang-format clang-tools
 
-    # 4. 检查代码格式 (调用 scripts/check_format.py)
+    # 4. 检查代码格式
     - name: Check Code Format
-      run: make check
+      run: make format-check
 
     # 5. 编译 Release 版本
     - name: Build Release

@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# 用该脚本覆盖valhalla_native/.git/hooks/pre-commit
+# 检查 git-clang-format 是否存在
+if ! command -v git-clang-format &> /dev/null; then
+    echo "Error: git-clang-format is not installed."
+    exit 1
+fi
+
+echo "Running git-clang-format on staged changes..."
+
+# 1. 运行 git-clang-format
+# --diff: 仅显示差异不修改 (用于检查)
+# -q: 安静模式
+# 这里的逻辑是：先让它直接跑，它会修改工作区文件
+output=$(git clang-format --force --style=file)
+
+# 2. 检查输出结果
+# 如果输出包含 "no modified files to format" 或 "clang-format did not modify any files"
+# 则说明格式正确，直接通过。
+if [[ "$output" == *"no modified files to format"* ]] || [[ "$output" == *"clang-format did not modify any files"* ]]; then
+    echo "✅ Code formatting is correct."
+    exit 0
+else
+    # 3. 如果文件被修改了
+    echo "⚠️  git-clang-format has modified the following files:"
+    echo "$output"
+    echo ""
+    echo "❌ Commit aborted automatically."
+    echo "👉 Please review the changes, 'git add' them, and commit again."
+
+    # 拒绝提交，让用户确认修改
+    exit 1
+fi
+

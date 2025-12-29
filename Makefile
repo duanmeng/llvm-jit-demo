@@ -62,12 +62,10 @@ release:            #: Build the release version
 # ==========================================
 # Format Tools
 # ==========================================
-
-check:              #: Check code format using scripts/check_format.py
-	$(PYTHON_EXECUTABLE) scripts/check_format.py
-
-fix:                #: Apply code format using scripts/apply_format.py
-	$(PYTHON_EXECUTABLE) scripts/apply_format.py
+format-check:
+	bash scripts/check-format.sh
+format-fix:
+	bash scripts/check-format.sh --fix
 doc-fix:
 	mdformat README.md
 
